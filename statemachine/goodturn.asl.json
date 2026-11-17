@@ -1,0 +1,90 @@
+{
+  "Comment": "GoodTurn Civic Aid Dispatch and Lifecycle State Machine",
+  "StartAt": "DispatchAlert",
+  "States": {
+    "DispatchAlert": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${MatchFunctionArn}",
+        "Payload": {
+          "action": "AWAIT_ACCEPTANCE",
+          "taskToken.$": "$$.Task.Token",
+          "requestId.$": "$.requestId",
+          "district.$": "$.district",
+          "category.$": "$.category",
+          "urgency.$": "$.urgency"
+        }
+      },
+      "TimeoutSeconds": 900,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.Timeout"
+          ],
+          "Next": "EscalateNoVolunteer"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "ExecutionFailed"
+        }
+      ],
+      "Next": "WaitForDeliveryVerification"
+    },
+    "WaitForDeliveryVerification": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${MatchFunctionArn}",
+        "Payload": {
+          "action": "AWAIT_VERIFICATION",
+          "taskToken.$": "$$.Task.Token",
+          "requestId.$": "$.requestId",
+          "volunteerId.$": "$.volunteerId"
+        }
+      },
+      "TimeoutSeconds": 7200,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.Timeout"
+          ],
+          "Next": "EscalateUnfulfilled"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "ExecutionFailed"
+        }
+      ],
+      "Next": "CompletedSuccess"
+    },
+    "EscalateNoVolunteer": {
+      "Type": "Pass",
+      "Result": {
+        "status": "ESCALATED",
+        "reason": "No volunteer matched within 15 minute window"
+      },
+      "End": true
+    },
+    "EscalateUnfulfilled": {
+      "Type": "Pass",
+      "Result": {
+        "status": "ESCALATED_UNFULFILLED",
+        "reason": "Delivery verification timed out"
+      },
+      "End": true
+    },
+    "ExecutionFailed": {
+      "Type": "Fail",
+      "Cause": "State machine execution encountered an unhandled error",
+      "Error": "ExecutionFailed"
+    },
+    "CompletedSuccess": {
+      "Type": "Succeed"
+    }
+  }
+}

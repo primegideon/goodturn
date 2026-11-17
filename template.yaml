@@ -1,0 +1,332 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: GoodTurn - Serverless Community Mutual Aid and Errand Dispatch Platform
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 256
+    Runtime: python3.12
+    Architectures:
+      - arm64
+    Environment:
+      Variables:
+        REQUESTS_TABLE: !Ref RequestsTable
+        VOLUNTEERS_TABLE: !Ref VolunteersTable
+        STATE_MACHINE_ARN: !Ref GoodTurnStateMachine
+        POWERTOOLS_SERVICE_NAME: goodturn
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Identity & Access: Amazon Cognito
+  # ---------------------------------------------------------------------------
+  GoodTurnUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-user-pool
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+
+  GoodTurnUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: goodturn-web-client
+      UserPoolId: !Ref GoodTurnUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+
+  RequestersGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: requesters
+      Description: Civic aid requesters
+      UserPoolId: !Ref GoodTurnUserPool
+
+  VolunteersGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: volunteers
+      Description: Verified community aid volunteers
+      UserPoolId: !Ref GoodTurnUserPool
+
+  # ---------------------------------------------------------------------------
+  # Core Data Store: Amazon DynamoDB
+  # ---------------------------------------------------------------------------
+  RequestsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-requests
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: requestId
+          AttributeType: S
+        - AttributeName: district
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: requestId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: DistrictIndex
+          KeySchema:
+            - AttributeName: district
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  VolunteersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-volunteers
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: volunteerId
+          AttributeType: S
+        - AttributeName: district
+          AttributeType: S
+      KeySchema:
+        - AttributeName: volunteerId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: DistrictIndex
+          KeySchema:
+            - AttributeName: district
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  # ---------------------------------------------------------------------------
+  # API Gateway HTTP API
+  # ---------------------------------------------------------------------------
+  GoodTurnHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - OPTIONS
+        AllowHeaders:
+          - "*"
+
+  # ---------------------------------------------------------------------------
+  # Workflow Orchestration: AWS Step Functions
+  # ---------------------------------------------------------------------------
+  GoodTurnStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionUri: statemachine/goodturn.asl.json
+      DefinitionSubstitutions:
+        MatchFunctionArn: !GetAtt MatchFunction.Arn
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref MatchFunction
+
+  # ---------------------------------------------------------------------------
+  # Lambda Functions
+  # ---------------------------------------------------------------------------
+  IntakeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/intake/
+      Handler: app.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RequestsTable
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !GetAtt GoodTurnStateMachine.Name
+        - Statement:
+            - Sid: BedrockInvokePolicy
+              Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: "*"
+      Events:
+        CreateRequest:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GoodTurnHttpApi
+            Path: /api/requests
+            Method: POST
+
+  StatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/status/
+      Handler: app.lambda_handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref RequestsTable
+      Events:
+        ListRequests:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GoodTurnHttpApi
+            Path: /api/requests
+            Method: GET
+        GetRequest:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GoodTurnHttpApi
+            Path: /api/requests/{requestId}
+            Method: GET
+
+  MatchFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/match/
+      Handler: app.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RequestsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref VolunteersTable
+
+  AcceptFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/accept/
+      Handler: app.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RequestsTable
+        - Statement:
+            - Sid: StepFunctionsTaskCallbackPolicy
+              Effect: Allow
+              Action:
+                - states:SendTaskSuccess
+                - states:SendTaskFailure
+              Resource: "*"
+      Events:
+        AcceptRequest:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GoodTurnHttpApi
+            Path: /api/requests/{requestId}/accept
+            Method: POST
+
+  VerifyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/verify/
+      Handler: app.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RequestsTable
+        - Statement:
+            - Sid: StepFunctionsTaskCallbackPolicy
+              Effect: Allow
+              Action:
+                - states:SendTaskSuccess
+                - states:SendTaskFailure
+              Resource: "*"
+      Events:
+        VerifyDelivery:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GoodTurnHttpApi
+            Path: /api/requests/{requestId}/verify
+            Method: POST
+
+  VolunteerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/volunteer/
+      Handler: app.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref VolunteersTable
+      Events:
+        ListVolunteers:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GoodTurnHttpApi
+            Path: /api/volunteers
+            Method: GET
+        RegisterVolunteer:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GoodTurnHttpApi
+            Path: /api/volunteers
+            Method: POST
+
+  # ---------------------------------------------------------------------------
+  # Static Web Hosting: Amazon S3
+  # ---------------------------------------------------------------------------
+  WebHostingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-frontend-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+
+  WebHostingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebHostingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Sub arn:aws:s3:::${WebHostingBucket}/*
+
+Outputs:
+  ApiEndpoint:
+    Description: HTTP API Gateway base URL
+    Value: !Sub "https://${GoodTurnHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref GoodTurnUserPool
+  UserPoolClientId:
+    Description: Cognito Web Client ID
+    Value: !Ref GoodTurnUserPoolClient
+  RequestsTableName:
+    Description: DynamoDB Requests Table Name
+    Value: !Ref RequestsTable
+  VolunteersTableName:
+    Description: DynamoDB Volunteers Table Name
+    Value: !Ref VolunteersTable
+  StateMachineArn:
+    Description: Step Functions State Machine ARN
+    Value: !Ref GoodTurnStateMachine
+  WebHostingBucketUrl:
+    Description: Static Web Hosting URL
+    Value: !GetAtt WebHostingBucket.WebsiteURL
